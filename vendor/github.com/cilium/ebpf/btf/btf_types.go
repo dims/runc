@@ -6,33 +6,36 @@ import (
 	"io"
 )
 
-//go:generate stringer -linecomment -output=btf_types_string.go -type=FuncLinkage,VarLinkage
+//go:generate stringer -linecomment -output=btf_types_string.go -type=FuncLinkage,VarLinkage,btfKind
 
 // btfKind describes a Type.
 type btfKind uint8
 
 // Equivalents of the BTF_KIND_* constants.
 const (
-	kindUnknown btfKind = iota
-	kindInt
-	kindPointer
-	kindArray
-	kindStruct
-	kindUnion
-	kindEnum
-	kindForward
-	kindTypedef
-	kindVolatile
-	kindConst
-	kindRestrict
+	kindUnknown  btfKind = iota // Unknown
+	kindInt                     // Int
+	kindPointer                 // Pointer
+	kindArray                   // Array
+	kindStruct                  // Struct
+	kindUnion                   // Union
+	kindEnum                    // Enum
+	kindForward                 // Forward
+	kindTypedef                 // Typedef
+	kindVolatile                // Volatile
+	kindConst                   // Const
+	kindRestrict                // Restrict
 	// Added ~4.20
-	kindFunc
-	kindFuncProto
+	kindFunc      // Func
+	kindFuncProto // FuncProto
 	// Added ~5.1
-	kindVar
-	kindDatasec
+	kindVar     // Var
+	kindDatasec // Datasec
 	// Added ~5.13
-	kindFloat
+	kindFloat // Float
+	// Added 5.16
+	kindDeclTag // DeclTag
+	kindTypeTag // TypeTag
 )
 
 // FuncLinkage describes BTF function linkage metadata.
@@ -85,58 +88,26 @@ type btfType struct {
 	SizeType uint32
 }
 
-func (k btfKind) String() string {
-	switch k {
-	case kindUnknown:
-		return "Unknown"
-	case kindInt:
-		return "Integer"
-	case kindPointer:
-		return "Pointer"
-	case kindArray:
-		return "Array"
-	case kindStruct:
-		return "Struct"
-	case kindUnion:
-		return "Union"
-	case kindEnum:
-		return "Enumeration"
-	case kindForward:
-		return "Forward"
-	case kindTypedef:
-		return "Typedef"
-	case kindVolatile:
-		return "Volatile"
-	case kindConst:
-		return "Const"
-	case kindRestrict:
-		return "Restrict"
-	case kindFunc:
-		return "Function"
-	case kindFuncProto:
-		return "Function Proto"
-	case kindVar:
-		return "Variable"
-	case kindDatasec:
-		return "Section"
-	case kindFloat:
-		return "Float"
-	default:
-		return fmt.Sprintf("Unknown (%d)", k)
-	}
-}
-
 func mask(len uint32) uint32 {
 	return (1 << len) - 1
 }
 
+func readBits(value, len, shift uint32) uint32 {
+	return (value >> shift) & mask(len)
+}
+
+func writeBits(value, len, shift, new uint32) uint32 {
+	value &^= mask(len) << shift
+	value |= (new & mask(len)) << shift
+	return value
+}
+
 func (bt *btfType) info(len, shift uint32) uint32 {
-	return (bt.Info >> shift) & mask(len)
+	return readBits(bt.Info, len, shift)
 }
 
 func (bt *btfType) setInfo(value, len, shift uint32) {
-	bt.Info &^= mask(len) << shift
-	bt.Info |= (value & mask(len)) << shift
+	bt.Info = writeBits(bt.Info, len, shift, value)
 }
 
 func (bt *btfType) Kind() btfKind {
@@ -198,6 +169,50 @@ func (rt *rawType) Marshal(w io.Writer, bo binary.ByteOrder) error {
 	return binary.Write(w, bo, rt.data)
 }
 
+// btfInt encodes additional data for integers.
+//
+//	? ? ? ? e e e e o o o o o o o o ? ? ? ? ? ? ? ? b b b b b b b b
+//	? = undefined
+//	e = encoding
+//	o = offset (bitfields?)
+//	b = bits (bitfields)
+type btfInt struct {
+	Raw uint32
+}
+
+const (
+	btfIntEncodingLen   = 4
+	btfIntEncodingShift = 24
+	btfIntOffsetLen     = 8
+	btfIntOffsetShift   = 16
+	btfIntBitsLen       = 8
+	btfIntBitsShift     = 0
+)
+
+func (bi btfInt) Encoding() IntEncoding {
+	return IntEncoding(readBits(bi.Raw, btfIntEncodingLen, btfIntEncodingShift))
+}
+
+func (bi *btfInt) SetEncoding(e IntEncoding) {
+	bi.Raw = writeBits(uint32(bi.Raw), btfIntEncodingLen, btfIntEncodingShift, uint32(e))
+}
+
+func (bi btfInt) Offset() Bits {
+	return Bits(readBits(bi.Raw, btfIntOffsetLen, btfIntOffsetShift))
+}
+
+func (bi *btfInt) SetOffset(offset uint32) {
+	bi.Raw = writeBits(bi.Raw, btfIntOffsetLen, btfIntOffsetShift, offset)
+}
+
+func (bi btfInt) Bits() Bits {
+	return Bits(readBits(bi.Raw, btfIntBitsLen, btfIntBitsShift))
+}
+
+func (bi *btfInt) SetBits(bits byte) {
+	bi.Raw = writeBits(bi.Raw, btfIntBitsLen, btfIntBitsShift, uint32(bits))
+}
+
 type btfArray struct {
 	Type      TypeID
 	IndexType TypeID
@@ -222,12 +237,16 @@ type btfVariable struct {
 
 type btfEnum struct {
 	NameOff uint32
-	Val     int32
+	Val     uint32
 }
 
 type btfParam struct {
 	NameOff uint32
 	Type    TypeID
+}
+
+type btfDeclTag struct {
+	ComponentIdx uint32
 }
 
 func readTypes(r io.Reader, bo binary.ByteOrder, typeLen uint32) ([]rawType, error) {
@@ -249,7 +268,7 @@ func readTypes(r io.Reader, bo binary.ByteOrder, typeLen uint32) ([]rawType, err
 		var data interface{}
 		switch header.Kind() {
 		case kindInt:
-			data = new(uint32)
+			data = new(btfInt)
 		case kindPointer:
 		case kindArray:
 			data = new(btfArray)
@@ -272,6 +291,9 @@ func readTypes(r io.Reader, bo binary.ByteOrder, typeLen uint32) ([]rawType, err
 		case kindDatasec:
 			data = make([]btfVarSecinfo, header.Vlen())
 		case kindFloat:
+		case kindDeclTag:
+			data = new(btfDeclTag)
+		case kindTypeTag:
 		default:
 			return nil, fmt.Errorf("type id %v: unknown kind: %v", id, header.Kind())
 		}
@@ -287,8 +309,4 @@ func readTypes(r io.Reader, bo binary.ByteOrder, typeLen uint32) ([]rawType, err
 
 		types = append(types, rawType{header, data})
 	}
-}
-
-func intEncoding(raw uint32) (IntEncoding, Bits, Bits) {
-	return IntEncoding((raw & 0x0f000000) >> 24), Bits(raw&0x00ff0000) >> 16, Bits(raw & 0x000000ff)
 }

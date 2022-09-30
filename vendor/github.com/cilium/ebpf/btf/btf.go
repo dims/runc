@@ -27,7 +27,7 @@ var (
 )
 
 // ID represents the unique ID of a BTF object.
-type ID uint32
+type ID = sys.BTFID
 
 // Spec represents decoded BTF.
 type Spec struct {
@@ -35,8 +35,8 @@ type Spec struct {
 	rawTypes []rawType
 	strings  *stringTable
 
-	// All types contained by the spec, the position of a type in the slice
-	// is its ID.
+	// All types contained by the spec. For the base type, the position of
+	// a type in the slice is its ID.
 	types types
 
 	// Type IDs indexed by type.
@@ -199,26 +199,39 @@ func loadSpecFromELF(file *internal.SafeELFFile) (*Spec, error) {
 		return nil, fmt.Errorf("compressed BTF is not supported")
 	}
 
-	return loadRawSpec(btfSection.ReaderAt, file.ByteOrder, sectionSizes, vars)
+	rawTypes, rawStrings, err := parseBTF(btfSection.ReaderAt, file.ByteOrder, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	err = fixupDatasec(rawTypes, rawStrings, sectionSizes, vars)
+	if err != nil {
+		return nil, err
+	}
+
+	return inflateSpec(rawTypes, rawStrings, file.ByteOrder, nil)
 }
 
-func loadRawSpec(btf io.ReaderAt, bo binary.ByteOrder, sectionSizes map[string]uint32, variableOffsets map[variable]uint32) (*Spec, error) {
-	rawTypes, rawStrings, err := parseBTF(btf, bo)
+func loadRawSpec(btf io.ReaderAt, bo binary.ByteOrder,
+	baseTypes types, baseStrings *stringTable) (*Spec, error) {
+
+	rawTypes, rawStrings, err := parseBTF(btf, bo, baseStrings)
 	if err != nil {
 		return nil, err
 	}
 
-	err = fixupDatasec(rawTypes, rawStrings, sectionSizes, variableOffsets)
+	return inflateSpec(rawTypes, rawStrings, bo, baseTypes)
+}
+
+func inflateSpec(rawTypes []rawType, rawStrings *stringTable, bo binary.ByteOrder,
+	baseTypes types) (*Spec, error) {
+
+	types, err := inflateRawTypes(rawTypes, baseTypes, rawStrings)
 	if err != nil {
 		return nil, err
 	}
 
-	types, err := inflateRawTypes(rawTypes, rawStrings)
-	if err != nil {
-		return nil, err
-	}
-
-	typeIDs, typesByName := indexTypes(types)
+	typeIDs, typesByName := indexTypes(types, TypeID(len(baseTypes)))
 
 	return &Spec{
 		rawTypes:   rawTypes,
@@ -230,7 +243,7 @@ func loadRawSpec(btf io.ReaderAt, bo binary.ByteOrder, sectionSizes map[string]u
 	}, nil
 }
 
-func indexTypes(types []Type) (map[Type]TypeID, map[essentialName][]Type) {
+func indexTypes(types []Type, typeIDOffset TypeID) (map[Type]TypeID, map[essentialName][]Type) {
 	namedTypes := 0
 	for _, typ := range types {
 		if typ.TypeName() != "" {
@@ -248,7 +261,7 @@ func indexTypes(types []Type) (map[Type]TypeID, map[essentialName][]Type) {
 		if name := newEssentialName(typ.TypeName()); name != "" {
 			typesByName[name] = append(typesByName[name], typ)
 		}
-		typeIDs[typ] = TypeID(i)
+		typeIDs[typ] = TypeID(i) + typeIDOffset
 	}
 
 	return typeIDs, typesByName
@@ -353,14 +366,15 @@ func guessRawBTFByteOrder(r io.ReaderAt) binary.ByteOrder {
 
 // parseBTF reads a .BTF section into memory and parses it into a list of
 // raw types and a string table.
-func parseBTF(btf io.ReaderAt, bo binary.ByteOrder) ([]rawType, *stringTable, error) {
+func parseBTF(btf io.ReaderAt, bo binary.ByteOrder, baseStrings *stringTable) ([]rawType, *stringTable, error) {
 	buf := internal.NewBufferedSectionReader(btf, 0, math.MaxInt64)
 	header, err := parseBTFHeader(buf, bo)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing .BTF header: %v", err)
 	}
 
-	rawStrings, err := readStringTable(io.NewSectionReader(btf, header.stringStart(), int64(header.StringLen)))
+	rawStrings, err := readStringTable(io.NewSectionReader(btf, header.stringStart(), int64(header.StringLen)),
+		baseStrings)
 	if err != nil {
 		return nil, nil, fmt.Errorf("can't read type names: %w", err)
 	}
@@ -433,7 +447,11 @@ func fixupDatasec(rawTypes []rawType, rawStrings *stringTable, sectionSizes map[
 func (s *Spec) Copy() *Spec {
 	types := copyTypes(s.types, nil)
 
-	typeIDs, typesByName := indexTypes(types)
+	typeIDOffset := TypeID(0)
+	if len(s.types) != 0 {
+		typeIDOffset = s.typeIDs[s.types[0]]
+	}
+	typeIDs, typesByName := indexTypes(types, typeIDOffset)
 
 	// NB: Other parts of spec are not copied since they are immutable.
 	return &Spec{
@@ -453,9 +471,10 @@ type marshalOpts struct {
 
 func (s *Spec) marshal(opts marshalOpts) ([]byte, error) {
 	var (
-		buf       bytes.Buffer
-		header    = new(btfHeader)
-		headerLen = binary.Size(header)
+		buf        bytes.Buffer
+		header     = new(btfHeader)
+		headerLen  = binary.Size(header)
+		stringsLen int
 	)
 
 	// Reserve space for the header. We have to write it last since
@@ -477,10 +496,12 @@ func (s *Spec) marshal(opts marshalOpts) ([]byte, error) {
 	typeLen := uint32(buf.Len() - headerLen)
 
 	// Write string section after type section.
-	stringsLen := s.strings.Length()
-	buf.Grow(stringsLen)
-	if err := s.strings.Marshal(&buf); err != nil {
-		return nil, err
+	if s.strings != nil {
+		stringsLen = s.strings.Length()
+		buf.Grow(stringsLen)
+		if err := s.strings.Marshal(&buf); err != nil {
+			return nil, err
+		}
 	}
 
 	// Fill out the header, and write it out.
@@ -591,6 +612,9 @@ func (s *Spec) AnyTypeByName(name string) (Type, error) {
 // Type exists in the Spec. If multiple candidates are found,
 // an error is returned.
 func (s *Spec) TypeByName(name string, typ interface{}) error {
+	typeInterface := reflect.TypeOf((*Type)(nil)).Elem()
+
+	// typ may be **T or *Type
 	typValue := reflect.ValueOf(typ)
 	if typValue.Kind() != reflect.Ptr {
 		return fmt.Errorf("%T is not a pointer", typ)
@@ -602,7 +626,12 @@ func (s *Spec) TypeByName(name string, typ interface{}) error {
 	}
 
 	wanted := typPtr.Type()
-	if !wanted.AssignableTo(reflect.TypeOf((*Type)(nil)).Elem()) {
+	if wanted == typeInterface {
+		// This is *Type. Unwrap the value's type.
+		wanted = typPtr.Elem().Type()
+	}
+
+	if !wanted.AssignableTo(typeInterface) {
 		return fmt.Errorf("%T does not satisfy Type interface", typ)
 	}
 
@@ -625,12 +654,20 @@ func (s *Spec) TypeByName(name string, typ interface{}) error {
 	}
 
 	if candidate == nil {
-		return fmt.Errorf("type %s: %w", name, ErrNotFound)
+		return fmt.Errorf("%s %s: %w", wanted, name, ErrNotFound)
 	}
 
 	typPtr.Set(reflect.ValueOf(candidate))
 
 	return nil
+}
+
+// LoadSplitSpecFromReader loads split BTF from a reader.
+//
+// Types from base are used to resolve references in the split BTF.
+// The returned Spec only contains types from the split BTF, not from the base.
+func LoadSplitSpecFromReader(r io.ReaderAt, base *Spec) (*Spec, error) {
+	return loadRawSpec(r, internal.NativeEndian, base.types, base.strings)
 }
 
 // TypesIterator iterates over types of a given spec.
@@ -659,8 +696,10 @@ func (iter *TypesIterator) Next() bool {
 
 // Handle is a reference to BTF loaded into the kernel.
 type Handle struct {
-	spec *Spec
-	fd   *sys.FD
+	fd *sys.FD
+
+	// Size of the raw BTF in bytes.
+	size uint32
 }
 
 // NewHandle loads BTF into the kernel.
@@ -671,7 +710,7 @@ func NewHandle(spec *Spec) (*Handle, error) {
 		return nil, err
 	}
 
-	if spec.byteOrder != internal.NativeEndian {
+	if spec.byteOrder != nil && spec.byteOrder != internal.NativeEndian {
 		return nil, fmt.Errorf("can't load %s BTF on %s", spec.byteOrder, internal.NativeEndian)
 	}
 
@@ -698,15 +737,21 @@ func NewHandle(spec *Spec) (*Handle, error) {
 		attr.BtfLogBuf = sys.NewSlicePointer(logBuf)
 		attr.BtfLogSize = uint32(len(logBuf))
 		attr.BtfLogLevel = 1
-		_, logErr := sys.BtfLoad(attr)
-		// NB: The syscall will never return ENOSPC as of 5.18-rc4.
-		return nil, internal.ErrorWithLog(err, logBuf, logErr)
+
+		// Up until at least kernel 6.0, the BTF verifier does not return ENOSPC
+		// if there are other verification errors. ENOSPC is only returned when
+		// the BTF blob is correct, a log was requested, and the provided buffer
+		// is too small.
+		_, ve := sys.BtfLoad(attr)
+		return nil, internal.ErrorWithLog(err, logBuf, errors.Is(ve, unix.ENOSPC))
 	}
 
-	return &Handle{spec.Copy(), fd}, nil
+	return &Handle{fd, attr.BtfSize}, nil
 }
 
 // NewHandleFromID returns the BTF handle for a given id.
+//
+// Prefer calling [ebpf.Program.Handle] or [ebpf.Map.Handle] if possible.
 //
 // Returns ErrNotExist, if there is no BTF with the given id.
 //
@@ -716,33 +761,59 @@ func NewHandleFromID(id ID) (*Handle, error) {
 		Id: uint32(id),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("get BTF by id: %w", err)
+		return nil, fmt.Errorf("get FD for ID %d: %w", id, err)
 	}
 
-	info, err := newInfoFromFd(fd)
+	info, err := newHandleInfoFromFD(fd)
 	if err != nil {
 		_ = fd.Close()
-		return nil, fmt.Errorf("get BTF spec for handle: %w", err)
+		return nil, err
 	}
 
-	return &Handle{info.BTF, fd}, nil
+	return &Handle{fd, info.size}, nil
 }
 
-// Spec returns the Spec that defined the BTF loaded into the kernel.
-func (h *Handle) Spec() *Spec {
-	return h.spec
+// Spec parses the kernel BTF into Go types.
+//
+// base is used to decode split BTF and may be nil.
+func (h *Handle) Spec(base *Spec) (*Spec, error) {
+	var btfInfo sys.BtfInfo
+	btfBuffer := make([]byte, h.size)
+	btfInfo.Btf, btfInfo.BtfSize = sys.NewSlicePointerLen(btfBuffer)
+
+	if err := sys.ObjInfo(h.fd, &btfInfo); err != nil {
+		return nil, err
+	}
+
+	var baseTypes types
+	var baseStrings *stringTable
+	if base != nil {
+		baseTypes = base.types
+		baseStrings = base.strings
+	}
+
+	return loadRawSpec(bytes.NewReader(btfBuffer), internal.NativeEndian, baseTypes, baseStrings)
 }
 
 // Close destroys the handle.
 //
 // Subsequent calls to FD will return an invalid value.
 func (h *Handle) Close() error {
+	if h == nil {
+		return nil
+	}
+
 	return h.fd.Close()
 }
 
 // FD returns the file descriptor for the handle.
 func (h *Handle) FD() int {
 	return h.fd.Int()
+}
+
+// Info returns metadata about the handle.
+func (h *Handle) Info() (*HandleInfo, error) {
+	return newHandleInfoFromFD(h.fd)
 }
 
 func marshalBTF(types interface{}, strings []byte, bo binary.ByteOrder) []byte {
