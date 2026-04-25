@@ -1,9 +1,12 @@
 package libcontainer
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/opencontainers/runc/libcontainer/utils"
 
 	"golang.org/x/sys/unix"
 )
@@ -206,5 +209,154 @@ func TestNeedsSetupDevStrangeSourceDest(t *testing.T) {
 	}
 	if !needsSetupDev(config) {
 		t.Fatal("expected needsSetupDev to be true, got false")
+	}
+}
+
+type recordedMount struct {
+	source      string
+	srcFileName string
+	srcFileType mountSourceType
+	target      string
+	dstFd       string
+	fstype      string
+	flags       uintptr
+	data        string
+}
+
+func recordMounts(calls *[]recordedMount) mountFunc {
+	return func(source string, srcFile *mountSource, target, dstFd, fstype string, flags uintptr, data string) error {
+		call := recordedMount{
+			source: source,
+			target: target,
+			dstFd:  dstFd,
+			fstype: fstype,
+			flags:  flags,
+			data:   data,
+		}
+		if srcFile != nil {
+			call.srcFileName = srcFile.file.Name()
+			call.srcFileType = srcFile.Type
+		}
+		*calls = append(*calls, call)
+		return nil
+	}
+}
+
+func TestMaskPathsWithSharedDirMask(t *testing.T) {
+	root := t.TempDir()
+	dir1 := filepath.Join(root, "dir1")
+	dir2 := filepath.Join(root, "dir2")
+	file := filepath.Join(root, "file")
+	missing := filepath.Join(root, "missing")
+	rootFd, err := os.OpenFile(root, unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_PATH, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rootFd.Close()
+	for _, dir := range []string{dir1, dir2} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(file, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls []recordedMount
+	mountLabel := "system_u:object_r:container_file_t:s0"
+	if err := maskPathsWithMount(rootFd, []string{
+		missing,
+		dir1,
+		dir2,
+		filepath.Join(dir1, "."),
+		file,
+	}, mountLabel, recordMounts(&calls)); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 mount calls, got %d: %#v", len(calls), calls)
+	}
+
+	if call := calls[0]; call.source != "tmpfs" || call.fstype != "tmpfs" || call.flags != unix.MS_RDONLY ||
+		call.target != dir1 || call.dstFd == "" || call.data != `context="system_u:object_r:container_file_t:s0"` {
+		t.Fatalf("unexpected shared tmpfs mount call: %#v", call)
+	}
+	if call := calls[1]; call.srcFileType != mountSourcePlain ||
+		call.target != dir2 || call.dstFd == "" || call.fstype != "" || call.flags != unix.MS_BIND || call.data != "" {
+		t.Fatalf("unexpected shared tmpfs bind mount call: %#v", call)
+	}
+	if call := calls[2]; call.srcFileName != "/dev/null" || call.srcFileType != mountSourcePlain ||
+		call.target != file || call.dstFd == "" || call.fstype != "" || call.flags != unix.MS_BIND || call.data != "" {
+		t.Fatalf("unexpected file mask mount call: %#v", call)
+	}
+}
+
+func TestIsProcFdPath(t *testing.T) {
+	for _, path := range []string{
+		"/proc/thread-self/fd/7",
+		"/proc/self/fd/7",
+		"/proc/self/task/123/fd/7",
+		"/proc/self/task/123/fd/../fd/7",
+		"/proc/123/fd/7",
+		"/proc/123/task/456/fd/7",
+	} {
+		if !isProcFdPath(path) {
+			t.Errorf("expected %q to be a procfd path", path)
+		}
+	}
+	for _, path := range []string{
+		"/proc/acpi",
+		"/proc/self/fdinfo/7",
+		"/proc/self/task/123/fdinfo/7",
+		"/proc/self/task/foo/fd/7",
+		"/proc/foo/fd/7",
+		"/proc/123/task/foo/fd/7",
+		"/sys/devices/system/cpu/cpu0/thermal_throttle",
+	} {
+		if isProcFdPath(path) {
+			t.Errorf("expected %q not to be a procfd path", path)
+		}
+	}
+}
+
+func TestMaskPathsDoesNotReuseProcFdMaskAsSharedSource(t *testing.T) {
+	root := t.TempDir()
+	dir1 := filepath.Join(root, "dir1")
+	dir2 := filepath.Join(root, "dir2")
+	dir3 := filepath.Join(root, "dir3")
+	rootFd, err := os.OpenFile(root, unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_PATH, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rootFd.Close()
+	for _, dir := range []string{dir1, dir2, dir3} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dir1File, err := os.OpenFile(dir1, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir1File.Close()
+	procFd, closer := utils.ProcThreadSelfFd(dir1File.Fd())
+	defer closer()
+
+	var calls []recordedMount
+	if err := maskPathsWithMount(rootFd, []string{procFd, dir2, dir3}, "", recordMounts(&calls)); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 mount calls, got %d: %#v", len(calls), calls)
+	}
+	for _, call := range calls[:2] {
+		if call.fstype != "tmpfs" || call.flags != unix.MS_RDONLY {
+			t.Fatalf("expected procfd source to force separate tmpfs mounts, got %#v", calls)
+		}
+	}
+	if call := calls[2]; call.srcFileType != mountSourcePlain ||
+		call.target != dir3 || call.fstype != "" || call.flags != unix.MS_BIND {
+		t.Fatalf("expected third directory to bind mount from second directory, got %#v", call)
 	}
 }

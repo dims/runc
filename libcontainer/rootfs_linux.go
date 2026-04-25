@@ -419,7 +419,7 @@ func mountCgroupV2(m mountEntry, c *mountConfig) error {
 		// Mask `/sys/fs/cgroup` to ensure it is read-only, even when `/sys` is mounted
 		// with `rbind,ro` (`runc spec --rootless` produces `rbind,ro` for `/sys`).
 		err = utils.WithProcfdFile(m.dstFile, func(procfd string) error {
-			return maskPaths([]string{procfd}, c.label)
+			return maskPaths(c.root, []string{procfd}, c.label)
 		})
 	}
 	return err
@@ -1328,12 +1328,64 @@ func verifyDevNull(f *os.File) error {
 	})
 }
 
+// mountFunc matches mountViaFds; tests replace it with a recorder.
+type mountFunc func(source string, srcFile *mountSource, target, dstFd, fstype string, flags uintptr, data string) error
+
+// isProcFdPath reports whether path is one of the procfs fd aliases runc uses
+// for mount targets. These aliases should not be kept as reusable sources.
+//
+// The accepted forms are (where <pid> and <tid> are decimal integers):
+//
+//	/proc/thread-self/fd/...
+//	/proc/self/fd/...
+//	/proc/<pid>/fd/...
+//	/proc/self/task/<tid>/fd/...
+//	/proc/<pid>/task/<tid>/fd/...
+func isProcFdPath(path string) bool {
+	parts := strings.Split(strings.Trim(pathrs.LexicallyCleanPath(path), "/"), "/")
+	if len(parts) < 3 || parts[0] != "proc" {
+		return false
+	}
+	if parts[1] == "thread-self" {
+		return parts[2] == "fd"
+	}
+	if parts[2] == "fd" && (parts[1] == "self" || isProcPidOrTid(parts[1])) {
+		return true
+	}
+	if len(parts) < 5 || parts[2] != "task" || parts[4] != "fd" {
+		return false
+	}
+	return isProcPidOrTid(parts[3]) && (parts[1] == "self" || isProcPidOrTid(parts[1]))
+}
+
+func isProcPidOrTid(value string) bool {
+	_, err := strconv.ParseUint(value, 10, 64)
+	return err == nil
+}
+
+func maskPathsAfterChroot(paths []string, mountLabel string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	rootFd, err := os.OpenFile("/", unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_PATH, 0)
+	if err != nil {
+		return fmt.Errorf("open rootfs handle for masked paths: %w", err)
+	}
+	defer rootFd.Close()
+	return maskPaths(rootFd, paths, mountLabel)
+}
+
+func maskPaths(rootFd *os.File, paths []string, mountLabel string) error {
+	return maskPathsWithMount(rootFd, paths, mountLabel, mountViaFds)
+}
+
 // maskPaths masks the top of the specified paths inside a container to avoid
 // security issues from processes reading information from non-namespace aware
 // mounts ( proc/kcore ).
 // For files, maskPath bind mounts /dev/null over the top of the specified path.
-// For directories, maskPath mounts read-only tmpfs over the top of the specified path.
-func maskPaths(paths []string, mountLabel string) error {
+// For directories, maskPath uses a shared read-only tmpfs: the first directory
+// gets a tmpfs mount, and later directories bind-mount the same tmpfs.
+func maskPathsWithMount(rootFd *os.File, paths []string, mountLabel string, mountFn mountFunc) error {
 	devNull, err := os.OpenFile("/dev/null", unix.O_PATH, 0)
 	if err != nil {
 		return fmt.Errorf("can't mask paths: %w", err)
@@ -1345,6 +1397,15 @@ func maskPaths(paths []string, mountLabel string) error {
 	devNullSrc := &mountSource{Type: mountSourcePlain, file: devNull}
 	procSelfFd, closer := utils.ProcThreadSelf("fd/")
 	defer closer()
+
+	var sharedDirMask *os.File
+	defer func() {
+		if sharedDirMask != nil {
+			_ = sharedDirMask.Close()
+		}
+	}()
+	var sharedDirMaskSrc *mountSource
+	maskedDirs := make(map[string]struct{})
 
 	for _, path := range paths {
 		// Open the target path; skip if it doesn't exist.
@@ -1362,14 +1423,38 @@ func maskPaths(paths []string, mountLabel string) error {
 		}
 		var dstType string
 		if st.IsDir() {
-			// Destination is a directory: bind mount a ro tmpfs over it.
+			// Directory targets use a read-only tmpfs.
 			dstType = "dir"
-			err = mount("tmpfs", path, "tmpfs", unix.MS_RDONLY, label.FormatMountLabel("", mountLabel))
+			cleanPath := pathrs.LexicallyCleanPath(path)
+			if _, ok := maskedDirs[cleanPath]; ok {
+				dstFh.Close()
+				continue
+			}
+			maskedDirs[cleanPath] = struct{}{}
+
+			dstFd := filepath.Join(procSelfFd, strconv.Itoa(int(dstFh.Fd())))
+			if sharedDirMaskSrc == nil {
+				err = mountFn("tmpfs", nil, path, dstFd, "tmpfs", unix.MS_RDONLY, label.FormatMountLabel("", mountLabel))
+				// Procfs fd aliases are not durable rootfs paths; let the
+				// next ordinary directory become the reusable source.
+				if err == nil && !isProcFdPath(path) {
+					sharedDirMask, err = reopenAfterMount(rootFd, dstFh, unix.O_PATH|unix.O_CLOEXEC)
+					if err != nil {
+						err = fmt.Errorf("can't reopen shared directory mask: %w", err)
+					}
+					if err == nil {
+						sharedDirMaskSrc = &mountSource{Type: mountSourcePlain, file: sharedDirMask}
+					}
+				}
+			} else {
+				// clone_mnt copies MNT_READONLY from the source vfsmount.
+				err = mountFn("", sharedDirMaskSrc, path, dstFd, "", unix.MS_BIND, "")
+			}
 		} else {
 			// Destination is a file: mount it to /dev/null.
 			dstType = "path"
 			dstFd := filepath.Join(procSelfFd, strconv.Itoa(int(dstFh.Fd())))
-			err = mountViaFds("", devNullSrc, path, dstFd, "", unix.MS_BIND, "")
+			err = mountFn("", devNullSrc, path, dstFd, "", unix.MS_BIND, "")
 		}
 		dstFh.Close()
 		if err != nil {

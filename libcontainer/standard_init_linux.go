@@ -142,7 +142,7 @@ func (l *linuxStandardInit) Init() error {
 		}
 	}
 
-	if err := maskPaths(l.config.Config.MaskPaths, l.config.Config.MountLabel); err != nil {
+	if err := maskPathsAfterChroot(l.config.Config.MaskPaths, l.config.Config.MountLabel); err != nil {
 		return err
 	}
 	pdeath, err := system.GetParentDeathSignal()
